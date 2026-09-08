@@ -24,6 +24,54 @@ declare global {
   }
 }
 
+// --- EIP-6963: Multi Injected Provider Discovery ---
+// With more than one wallet extension installed, a bare `window.ethereum`
+// is unreliable: it's whichever extension won the injection race, which is
+// why connecting could silently pick the "wrong"/random wallet. EIP-6963
+// lets every installed wallet announce itself (with its own name + icon)
+// instead of fighting over a single global, so we can show a real picker
+// and use the exact wallet the user selects.
+export interface EIP6963ProviderInfo {
+  uuid: string;
+  name: string;
+  icon: string;
+  rdns: string;
+}
+
+export interface EIP6963ProviderDetail {
+  info: EIP6963ProviderInfo;
+  provider: EthereumProvider;
+}
+
+interface EIP6963AnnounceEvent extends Event {
+  detail: EIP6963ProviderDetail;
+}
+
+const WALLET_RDNS_KEY = "bnbmint.walletRdns";
+
+function useEip6963Providers() {
+  const [providers, setProviders] = useState<Map<string, EIP6963ProviderDetail>>(new Map());
+
+  useEffect(() => {
+    function onAnnounce(event: Event) {
+      const detail = (event as EIP6963AnnounceEvent).detail;
+      if (!detail?.info?.uuid) return;
+      setProviders((prev) => {
+        if (prev.has(detail.info.uuid)) return prev;
+        const next = new Map(prev);
+        next.set(detail.info.uuid, detail);
+        return next;
+      });
+    }
+    window.addEventListener("eip6963:announceProvider", onAnnounce);
+    // Ask every installed wallet to (re-)announce itself.
+    window.dispatchEvent(new Event("eip6963:requestProvider"));
+    return () => window.removeEventListener("eip6963:announceProvider", onAnnounce);
+  }, []);
+
+  return providers;
+}
+
 interface WalletContextValue {
   address: string | null;
   connected: boolean;
@@ -36,7 +84,11 @@ interface WalletContextValue {
   provider: BrowserProvider | null;
   signer: JsonRpcSigner | null;
   hasInjectedWallet: boolean;
-  connect: () => Promise<void>;
+  /** All wallets detected via EIP-6963, each with its own name + icon. */
+  availableWallets: EIP6963ProviderDetail[];
+  /** Info (name + icon) for the wallet currently connected, if known. */
+  selectedWallet: EIP6963ProviderInfo | null;
+  connect: (rdns?: string) => Promise<void>;
   disconnect: () => void;
   switchToTargetNetwork: () => Promise<void>;
 }
@@ -53,8 +105,14 @@ export default function WalletContextProvider({ children }: { children: React.Re
   const [provider, setProvider] = useState<BrowserProvider | null>(null);
   const [signer, setSigner] = useState<JsonRpcSigner | null>(null);
   const [targetNetworkKey, setTargetNetworkKeyState] = useState<ChainKey>(DEFAULT_NETWORK);
+  const [selectedWallet, setSelectedWallet] = useState<EIP6963ProviderInfo | null>(null);
+  const [activeRawProvider, setActiveRawProvider] = useState<EthereumProvider | null>(null);
 
-  const hasInjectedWallet = typeof window !== "undefined" && Boolean(window.ethereum);
+  const eip6963Providers = useEip6963Providers();
+  const availableWallets = useMemo(() => Array.from(eip6963Providers.values()), [eip6963Providers]);
+
+  const hasInjectedWallet =
+    typeof window !== "undefined" && (Boolean(window.ethereum) || availableWallets.length > 0);
 
   // Restore the last network the user picked (e.g. Robinhood vs BSC)
   // across visits, same as autoconnect below.
@@ -89,20 +147,53 @@ export default function WalletContextProvider({ children }: { children: React.Re
     }
   }, []);
 
+  // Resolve which raw EIP-1193 provider to talk to for a given wallet
+  // choice: prefer the exact EIP-6963 provider the user picked (or
+  // previously picked, by rdns), fall back to the sole detected wallet if
+  // there's only one, and only fall back to the single global
+  // `window.ethereum` for older wallets that don't support EIP-6963 yet.
+  const resolveRawProvider = useCallback(
+    (rdns?: string): { raw: EthereumProvider; info: EIP6963ProviderInfo | null } | null => {
+      if (rdns) {
+        const match = availableWallets.find((w) => w.info.rdns === rdns);
+        if (match) return { raw: match.provider, info: match.info };
+      }
+      if (availableWallets.length === 1) {
+        return { raw: availableWallets[0].provider, info: availableWallets[0].info };
+      }
+      if (availableWallets.length === 0 && window.ethereum) {
+        return { raw: window.ethereum, info: null };
+      }
+      return null;
+    },
+    [availableWallets]
+  );
+
   // Silently reconnect on load if the user connected before and didn't
-  // disconnect — mirrors autoConnect on the Solana wallet adapter.
+  // disconnect — mirrors autoConnect on the Solana wallet adapter. Waits a
+  // tick so EIP-6963 announcements have time to arrive, so autoconnect
+  // reuses the exact same wallet (icon included) rather than guessing.
   useEffect(() => {
-    if (!window.ethereum) return;
     if (window.localStorage.getItem(AUTOCONNECT_KEY) !== "true") return;
+    const storedRdns = window.localStorage.getItem(WALLET_RDNS_KEY) || undefined;
 
-    const browserProvider = new BrowserProvider(window.ethereum);
-    setProvider(browserProvider);
-    refreshSigner(browserProvider);
-  }, [refreshSigner]);
+    const timeout = setTimeout(() => {
+      const resolved = resolveRawProvider(storedRdns);
+      if (!resolved) return;
+      const browserProvider = new BrowserProvider(resolved.raw);
+      setProvider(browserProvider);
+      setActiveRawProvider(resolved.raw);
+      setSelectedWallet(resolved.info);
+      refreshSigner(browserProvider);
+    }, 150);
+
+    return () => clearTimeout(timeout);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableWallets.length]);
 
   useEffect(() => {
-    if (!window.ethereum) return;
-    const ethereum = window.ethereum;
+    const ethereum = activeRawProvider;
+    if (!ethereum) return;
 
     function handleAccountsChanged(...args: unknown[]) {
       const accounts = args[0] as string[];
@@ -110,6 +201,8 @@ export default function WalletContextProvider({ children }: { children: React.Re
         setAddress(null);
         setSigner(null);
         setProvider(null);
+        setActiveRawProvider(null);
+        setSelectedWallet(null);
         window.localStorage.removeItem(AUTOCONNECT_KEY);
       } else if (provider) {
         refreshSigner(provider);
@@ -126,44 +219,63 @@ export default function WalletContextProvider({ children }: { children: React.Re
       ethereum.removeListener("accountsChanged", handleAccountsChanged);
       ethereum.removeListener("chainChanged", handleChainChanged);
     };
-  }, [provider, refreshSigner]);
+  }, [activeRawProvider, provider, refreshSigner]);
 
-  const connect = useCallback(async () => {
-    if (!window.ethereum) {
-      window.open("https://metamask.io/download", "_blank", "noopener,noreferrer");
-      return;
-    }
-    setConnecting(true);
-    try {
-      const browserProvider = new BrowserProvider(window.ethereum);
-      await browserProvider.send("eth_requestAccounts", []);
-      setProvider(browserProvider);
-      await refreshSigner(browserProvider);
-      window.localStorage.setItem(AUTOCONNECT_KEY, "true");
-    } finally {
-      setConnecting(false);
-    }
-  }, [refreshSigner]);
+  // If `rdns` is omitted and more than one wallet is installed, the caller
+  // (WalletButton) is expected to have shown a picker first and to call
+  // connect() again with the chosen rdns -- this never silently guesses
+  // between multiple installed wallets.
+  const connect = useCallback(
+    async (rdns?: string) => {
+      const resolved = resolveRawProvider(rdns);
+      if (!resolved) {
+        if (availableWallets.length > 1) return; // let the picker handle it
+        window.open("https://metamask.io/download", "_blank", "noopener,noreferrer");
+        return;
+      }
+      setConnecting(true);
+      try {
+        const browserProvider = new BrowserProvider(resolved.raw);
+        await browserProvider.send("eth_requestAccounts", []);
+        setProvider(browserProvider);
+        setActiveRawProvider(resolved.raw);
+        setSelectedWallet(resolved.info);
+        await refreshSigner(browserProvider);
+        window.localStorage.setItem(AUTOCONNECT_KEY, "true");
+        if (resolved.info) {
+          window.localStorage.setItem(WALLET_RDNS_KEY, resolved.info.rdns);
+        } else {
+          window.localStorage.removeItem(WALLET_RDNS_KEY);
+        }
+      } finally {
+        setConnecting(false);
+      }
+    },
+    [availableWallets.length, refreshSigner, resolveRawProvider]
+  );
 
   const disconnect = useCallback(() => {
     setAddress(null);
     setSigner(null);
     setProvider(null);
+    setActiveRawProvider(null);
+    setSelectedWallet(null);
     window.localStorage.removeItem(AUTOCONNECT_KEY);
+    window.localStorage.removeItem(WALLET_RDNS_KEY);
   }, []);
 
   const switchToTargetNetwork = useCallback(async () => {
-    if (!window.ethereum) return;
+    if (!activeRawProvider) return;
     const network = NETWORKS[targetNetworkKey];
     try {
-      await window.ethereum.request({
+      await activeRawProvider.request({
         method: "wallet_switchEthereumChain",
         params: [{ chainId: network.chainIdHex }],
       });
     } catch (err: any) {
       // 4902 = chain not added to the wallet yet
       if (err?.code === 4902) {
-        await window.ethereum.request({
+        await activeRawProvider.request({
           method: "wallet_addEthereumChain",
           params: [network.walletAddChainParams],
         });
@@ -171,7 +283,7 @@ export default function WalletContextProvider({ children }: { children: React.Re
         throw err;
       }
     }
-  }, [targetNetworkKey]);
+  }, [activeRawProvider, targetNetworkKey]);
 
   const targetNetwork = NETWORKS[targetNetworkKey];
 
@@ -188,6 +300,8 @@ export default function WalletContextProvider({ children }: { children: React.Re
       provider,
       signer,
       hasInjectedWallet,
+      availableWallets,
+      selectedWallet,
       connect,
       disconnect,
       switchToTargetNetwork,
@@ -202,6 +316,8 @@ export default function WalletContextProvider({ children }: { children: React.Re
       provider,
       signer,
       hasInjectedWallet,
+      availableWallets,
+      selectedWallet,
       connect,
       disconnect,
       switchToTargetNetwork,
@@ -220,3 +336,4 @@ export function useWallet(): WalletContextValue {
 }
 
 export { networkByChainId };
+
